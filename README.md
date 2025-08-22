@@ -4,5 +4,5 @@ When enabled, this plugin strips players of their weapons, and only allows the Z
 as well as utility and knife.
 
 To activate and deactivate the plugin, you must type css_zeus_mode 0 or 1 into the console.
-Stripped loadouts are saved to an internal database, and are then restored upon disablement of the
+Stripped loadouts are saved to an internal database, and are then restored upon disabling of the
 plugin. 
