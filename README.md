@@ -1,3 +1,5 @@
+A CS2 CounterStrikeSharp plugin that forces a Zeus Only Mode!
+
 Zeus Only Mode creates a new gaming experience for those looking to ZAP their friends in multiplayer.
 
 When enabled, this plugin strips players of their weapons, and only allows the Zeus to be used, 
