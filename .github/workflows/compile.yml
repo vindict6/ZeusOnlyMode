@@ -2,9 +2,12 @@ name: Compile and Release ZeusOnlyMode
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main # Automatically runs when you push or merge to the main branch
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -14,6 +17,15 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # IMPORTANT: Required to fetch past tags so it knows what version is next
+
+      - name: Bump Version and Create Tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch # By default, bumps the last number (e.g., v1.0.0 -> v1.0.1)
 
       - name: Setup .NET 8.0
         uses: actions/setup-dotnet@v4
@@ -24,24 +36,29 @@ jobs:
         run: dotnet restore ZeusOnlyMode.csproj
 
       - name: Build and Publish
-        # Publish to a temporary directory first
         run: dotnet publish ZeusOnlyMode.csproj -c Release -o ./publish_temp
 
       - name: Prepare Folder Structure
-        # Create the exact CounterStrikeSharp folder structure and move files into it
         run: |
           mkdir -p ./release_stage/addons/counterstrikesharp/plugins/ZeusOnlyMode
           mv ./publish_temp/* ./release_stage/addons/counterstrikesharp/plugins/ZeusOnlyMode/
 
       - name: Zip Release Artifact
-        # Name the zip dynamically using github.ref_name (e.g., ZeusOnlyMode-v1.0.0.zip)
+        # Uses the new tag generated in the step above
         run: |
           cd release_stage
-          zip -r "ZeusOnlyMode-${{ github.ref_name }}.zip" addons/
+          zip -r "ZeusOnlyMode-${{ steps.tag_version.outputs.new_tag }}.zip" addons/
 
-      - name: Upload Build Artifact
+      - name: Upload Build Artifact (Actions Tab)
         uses: actions/upload-artifact@v4
         with:
-          name: ZeusOnlyMode-${{ github.ref_name }}
-          path: release_stage/ZeusOnlyMode-${{ github.ref_name }}.zip
+          name: ZeusOnlyMode-${{ steps.tag_version.outputs.new_tag }}
+          path: release_stage/ZeusOnlyMode-${{ steps.tag_version.outputs.new_tag }}.zip
           retention-days: 7
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag_version.outputs.new_tag }}
+          files: release_stage/ZeusOnlyMode-${{ steps.tag_version.outputs.new_tag }}.zip
+          generate_release_notes: true
