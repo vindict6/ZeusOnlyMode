@@ -1,0 +1,40 @@
+name: Compile and Release ZeusOnlyMode
+
+on:
+  push:
+    tags:
+      - 'v*' # Automatically runs when you push a tag like 'v1.0.0'
+  workflow_dispatch: # Allows you to manually click "Run workflow" from the Actions tab
+
+jobs:
+  build:
+    name: Build Plugin
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore Dependencies
+        run: dotnet restore ZeusOnlyMode.csproj
+
+      - name: Build and Publish
+        # We use publish instead of build to cleanly gather the .dll and its dependencies into an output folder
+        run: dotnet publish ZeusOnlyMode.csproj -c Release -o ./publish/ZeusOnlyMode
+
+      - name: Zip Release Artifact
+        run: |
+          cd publish
+          zip -r ZeusOnlyMode.zip ZeusOnlyMode/
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeusOnlyMode
+          path: publish/ZeusOnlyMode.zip
+          retention-days: 7
