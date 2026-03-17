@@ -3,8 +3,8 @@ name: Compile and Release ZeusOnlyMode
 on:
   push:
     tags:
-      - 'v*' # Automatically runs when you push a tag like 'v1.0.0'
-  workflow_dispatch: # Allows you to manually click "Run workflow" from the Actions tab
+      - 'v*'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -24,17 +24,24 @@ jobs:
         run: dotnet restore ZeusOnlyMode.csproj
 
       - name: Build and Publish
-        # We use publish instead of build to cleanly gather the .dll and its dependencies into an output folder
-        run: dotnet publish ZeusOnlyMode.csproj -c Release -o ./publish/ZeusOnlyMode
+        # Publish to a temporary directory first
+        run: dotnet publish ZeusOnlyMode.csproj -c Release -o ./publish_temp
+
+      - name: Prepare Folder Structure
+        # Create the exact CounterStrikeSharp folder structure and move files into it
+        run: |
+          mkdir -p ./release_stage/addons/counterstrikesharp/plugins/ZeusOnlyMode
+          mv ./publish_temp/* ./release_stage/addons/counterstrikesharp/plugins/ZeusOnlyMode/
 
       - name: Zip Release Artifact
+        # Name the zip dynamically using github.ref_name (e.g., ZeusOnlyMode-v1.0.0.zip)
         run: |
-          cd publish
-          zip -r ZeusOnlyMode.zip ZeusOnlyMode/
+          cd release_stage
+          zip -r "ZeusOnlyMode-${{ github.ref_name }}.zip" addons/
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ZeusOnlyMode
-          path: publish/ZeusOnlyMode.zip
+          name: ZeusOnlyMode-${{ github.ref_name }}
+          path: release_stage/ZeusOnlyMode-${{ github.ref_name }}.zip
           retention-days: 7
