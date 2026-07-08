@@ -194,8 +194,11 @@ namespace ZeusOnlyMode
             // the extended lightning visual and chicken detection.
             RegisterEventHandler<EventBulletImpact>(OnBulletImpact);
 
-            // Superzeus knockback on zapped players
-            RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
+            // Superzeus knockback. Applied in a PRE-damage hook so the launch
+            // velocity is on the pawn BEFORE the lethal hit resolves — the
+            // ragdoll then inherits it at creation (the only thing that
+            // actually moves a ragdoll). Also launches survivors.
+            RegisterListener<Listeners.OnEntityTakeDamagePre>(OnEntityTakeDamagePre);
 
             // Make sure the roast model is available even on maps that never
             // loaded it themselves
@@ -512,18 +515,17 @@ namespace ZeusOnlyMode
         {
             // Copy everything we need BEFORE removing the chicken
             var origin = chicken.AbsOrigin!;
-            // A few ticks lower on Z — the roast model's origin sits higher
-            // than the live chicken's, so without this it floats.
-            var pos = new Vector(origin.X, origin.Y, origin.Z - 6.0f);
+            // Spawn at the chicken's height (reverted). As a physics prop it
+            // settles onto the ground on its own.
+            var pos = new Vector(origin.X, origin.Y, origin.Z + 2.0f);
             float yaw = (float)rng.Next(0, 360);
             string liveModel = chicken.CBodyComponent?.SceneNode?.GetSkeletonInstance().ModelState.ModelName ?? string.Empty;
 
             chicken.AcceptInput("Kill");
 
-            var roast = Utilities.CreateEntityByName<CDynamicProp>("prop_dynamic_override");
+            // Physics prop so gravity drops the roast to the floor
+            var roast = Utilities.CreateEntityByName<CPhysicsProp>("prop_physics_override");
             if (roast == null) return;
-
-            roast.DispatchSpawn();
 
             string cookedModel = Config.CookedChickenModel;
             if (!string.IsNullOrEmpty(cookedModel))
@@ -544,8 +546,12 @@ namespace ZeusOnlyMode
                 return;
             }
 
-            // Upright — the roast sits on the ground like the real one
+            roast.DispatchSpawn();
             roast.Teleport(pos, new QAngle(0.0f, yaw, 0.0f), new Vector());
+
+            // Enable motion and wake the physics body so it actually falls
+            roast.AcceptInput("EnableMotion");
+            roast.AcceptInput("Wake");
 
             SpawnSteam(new Vector(origin.X, origin.Y, origin.Z + 4.0f));
 
@@ -570,6 +576,10 @@ namespace ZeusOnlyMode
             particle.StartActive = true;
             particle.Teleport(pos, new QAngle(), new Vector());
             particle.DispatchSpawn();
+
+            // StartActive alone often doesn't kick the system; the explicit
+            // Start input is what reliably makes it emit.
+            particle.AcceptInput("Start");
 
             var particleRef = particle;
             AddTimer(60.0f, () =>
@@ -668,7 +678,7 @@ namespace ZeusOnlyMode
                               * (superZeusEnabled ? SuperZeusRangeMultiplier : 1.0f);
                 var end = new Vector(eye.X + fwd.X * range, eye.Y + fwd.Y * range, eye.Z + fwd.Z * range);
 
-                HandleZap(eye, end);
+                HandleZap(player, eye, end);
             });
 
             return HookResult.Continue;
@@ -693,83 +703,58 @@ namespace ZeusOnlyMode
             var eye = GetEyePosition(pawn);
             var end = new Vector(ev.X, ev.Y, ev.Z);
 
-            HandleZap(eye, end);
+            HandleZap(player, eye, end);
 
             return HookResult.Continue;
         }
 
-        // Superzeus punch: shove the victim (or their fresh ragdoll — the
-        // velocity applied at the moment of the hit carries into it) away
-        // from the shooter.
-        private HookResult OnPlayerHurt(EventPlayerHurt ev, GameEventInfo info)
+        // Superzeus knockback, done the way that actually moves a ragdoll.
+        //
+        // A ragdoll's motion comes from m_vecRagdollVelocity, which the engine
+        // copies from the pawn's velocity at the instant the ragdoll is created
+        // during Event_Killed. So the trick is to set the victim's velocity
+        // BEFORE the damage is applied (this hook is Pre): if the hit kills
+        // them, the ragdoll inherits the launch; if they survive, the same
+        // velocity shoves the living player. Pushing the ragdoll after the
+        // fact (the old approach) does nothing, because the physics bodies were
+        // already spawned with zero inherited velocity.
+        private HookResult OnEntityTakeDamagePre(CBaseEntity entity, CTakeDamageInfo info)
         {
             if (!superZeusEnabled)
                 return HookResult.Continue;
 
-            if (ev.Weapon != "taser")
+            if (entity == null || !entity.IsValid || entity.DesignerName != "player")
                 return HookResult.Continue;
 
-            var victim = ev.Userid;
-            var attacker = ev.Attacker;
-            if (victim == null || !victim.IsValid || attacker == null || !attacker.IsValid || victim == attacker)
+            bool fromTaser =
+                info.Ability.Value?.DesignerName == "weapon_taser" ||
+                ((int)info.BitsDamageType & (int)DamageTypes_t.DMG_SHOCK) != 0;
+            if (!fromTaser)
                 return HookResult.Continue;
 
-            var victimPawn = victim.PlayerPawn.Value;
-            var attackerPawn = attacker.PlayerPawn.Value;
-            if (victimPawn == null || victimPawn.AbsOrigin == null ||
-                attackerPawn == null || attackerPawn.AbsOrigin == null)
+            var attacker = info.Attacker.Value;
+            if (attacker == null || !attacker.IsValid || attacker.Index == entity.Index)
                 return HookResult.Continue;
 
-            float dx = victimPawn.AbsOrigin.X - attackerPawn.AbsOrigin.X;
-            float dy = victimPawn.AbsOrigin.Y - attackerPawn.AbsOrigin.Y;
+            var victimPawn = entity.As<CCSPlayerPawn>();
+            if (victimPawn.AbsOrigin == null || attacker.AbsOrigin == null)
+                return HookResult.Continue;
+
+            float dx = victimPawn.AbsOrigin.X - attacker.AbsOrigin.X;
+            float dy = victimPawn.AbsOrigin.Y - attacker.AbsOrigin.Y;
             float horiz = (float)Math.Sqrt(dx * dx + dy * dy);
             if (horiz < 1.0f) { dx = 1.0f; dy = 0.0f; horiz = 1.0f; }
 
             float force = Config.SuperZeusKnockbackForce;
             var vel = new Vector(dx / horiz * force, dy / horiz * force, force * 0.35f);
 
-            if (victimPawn.LifeState == (byte)LifeState_t.LIFE_ALIVE)
-            {
-                // Survived the shot — shove the living player directly.
-                victimPawn.Teleport(null, null, vel);
-            }
-            else
-            {
-                // The zeus almost always kills outright, which instantly turns
-                // the pawn into a cs_ragdoll — teleporting the dead pawn does
-                // nothing (that was the "only affects guns" bug). The ragdoll
-                // isn't exposed as a pawn property in this API version, so we
-                // find it by designer name, matching the one that spawned at
-                // the victim's death position, and shove that.
-                float px = victimPawn.AbsOrigin.X;
-                float py = victimPawn.AbsOrigin.Y;
-                float pz = victimPawn.AbsOrigin.Z;
-
-                Server.NextFrame(() =>
-                {
-                    CBaseEntity? nearest = null;
-                    float best = 96.0f * 96.0f; // must be within ~96 units of death spot
-
-                    foreach (var rag in Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("cs_ragdoll"))
-                    {
-                        if (rag == null || !rag.IsValid || rag.AbsOrigin == null) continue;
-
-                        float rdx = rag.AbsOrigin.X - px;
-                        float rdy = rag.AbsOrigin.Y - py;
-                        float rdz = rag.AbsOrigin.Z - pz;
-                        float d2 = rdx * rdx + rdy * rdy + rdz * rdz;
-
-                        if (d2 < best) { best = d2; nearest = rag; }
-                    }
-
-                    nearest?.Teleport(null, null, vel);
-                });
-            }
+            // Set the pawn's velocity now, before death resolves.
+            victimPawn.Teleport(null, null, vel);
 
             return HookResult.Continue;
         }
 
-        private void HandleZap(Vector eye, Vector end)
+        private void HandleZap(CCSPlayerController player, Vector eye, Vector end)
         {
             var dir = new Vector(end.X - eye.X, end.Y - eye.Y, end.Z - eye.Z);
             float len = (float)Math.Sqrt(dir.X * dir.X + dir.Y * dir.Y + dir.Z * dir.Z);
@@ -778,7 +763,7 @@ namespace ZeusOnlyMode
             var unit = new Vector(dir.X / len, dir.Y / len, dir.Z / len);
 
             if (superZeusEnabled)
-                DrawZeusLightning(eye, end, unit);
+                DrawZeusLightning(player, len);
 
             // Chicken detection always spans the zeus's FULL current reach —
             // impact events can under-report distance (or not arrive at all on
@@ -802,26 +787,8 @@ namespace ZeusOnlyMode
             return new Vector(pawn.AbsOrigin!.X, pawn.AbsOrigin.Y, pawn.AbsOrigin.Z + viewZ);
         }
 
-        private void DrawZeusLightning(Vector eye, Vector end, Vector unit)
+        private void DrawZeusLightning(CCSPlayerController player, float beamLength)
         {
-            // Horizontal perpendicular, used for the barrel offset and for
-            // jittering the bolt midpoints sideways
-            float hLen = (float)Math.Sqrt(unit.X * unit.X + unit.Y * unit.Y);
-            var right = hLen < 0.01f
-                ? new Vector(1.0f, 0.0f, 0.0f) // aiming straight up/down
-                : new Vector(unit.Y / hLen, -unit.X / hLen, 0.0f);
-
-            // Barrel of the zeus: a bit forward, a touch right, a hair below
-            // the eye — Z stays aligned with the gun instead of sagging
-            var barrel = new Vector(
-                eye.X + unit.X * 16.0f + right.X * 5.0f,
-                eye.Y + unit.Y * 16.0f + right.Y * 5.0f,
-                eye.Z + unit.Z * 16.0f - 3.0f);
-
-            // Build 3 bolts of 3 segments each. Instead of spawning-and-
-            // discarding, we keep the beam entities alive and re-jitter their
-            // interior points every animation frame — the arc visibly crawls
-            // and flickers along its length like a real lightning strike.
             var amps = new float[] { 6.0f, 10.0f, 14.0f };
             var bolts = new List<CBeam[]>(3);
 
@@ -848,9 +815,34 @@ namespace ZeusOnlyMode
 
             if (bolts.Count == 0) return;
 
-            // Recompute every segment with fresh jitter
+            // Recompute barrel + endpoint from the shooter's LIVE eye/aim every
+            // frame, so if the player turns or moves during the animation the
+            // bolts stay glued to the weapon instead of hanging in the air.
             void Reposition()
             {
+                var pawn = player.PlayerPawn.Value;
+                if (pawn == null || pawn.AbsOrigin == null) return;
+
+                var eye = GetEyePosition(pawn);
+                var fwd = AngleToForward(pawn.EyeAngles);
+
+                float hLen = (float)Math.Sqrt(fwd.X * fwd.X + fwd.Y * fwd.Y);
+                var right = hLen < 0.01f
+                    ? new Vector(1.0f, 0.0f, 0.0f) // aiming straight up/down
+                    : new Vector(fwd.Y / hLen, -fwd.X / hLen, 0.0f);
+
+                // Barrel of the zeus: forward, a touch right, below the eye.
+                var barrel = new Vector(
+                    eye.X + fwd.X * 16.0f + right.X * 5.0f,
+                    eye.Y + fwd.Y * 16.0f + right.Y * 5.0f,
+                    eye.Z + fwd.Z * 16.0f - 6.0f);
+
+                // Endpoint follows current aim at the original zap length.
+                var end = new Vector(
+                    eye.X + fwd.X * beamLength,
+                    eye.Y + fwd.Y * beamLength,
+                    eye.Z + fwd.Z * beamLength);
+
                 for (int b = 0; b < bolts.Count; b++)
                 {
                     float amp = amps[b];
@@ -863,11 +855,11 @@ namespace ZeusOnlyMode
                 }
             }
 
-            // First frame immediately, then animate for ~0.4s (10 frames @ 40ms)
+            // First frame immediately, then animate for ~0.2s (5 frames @ 40ms)
             Reposition();
 
             int frames = 0;
-            const int maxFrames = 10;
+            const int maxFrames = 5;
             CounterStrikeSharp.API.Modules.Timers.Timer? anim = null;
             anim = AddTimer(0.04f, () =>
             {
@@ -909,7 +901,7 @@ namespace ZeusOnlyMode
             if (beam == null) return null;
 
             beam.Render = Color.FromArgb(255, 170, 215, 255); // electric blue-white
-            beam.Width = 0.25f;
+            beam.Width = 0.12f;
             beam.DispatchSpawn();
             return beam;
         }
