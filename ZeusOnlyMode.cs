@@ -755,18 +755,26 @@ namespace ZeusOnlyMode
 
             float force = Config.SuperZeusKnockbackForce;
             var vel = new Vector(dx / horiz * force, dy / horiz * force, force * 0.35f);
-            
-            // 1. Explicitly set AbsVelocity so the ragdoll snapshot catches it immediately upon death
+
+            // 1. Push the living player (this keeps your cool knockback for survivors)
             if (victimPawn.AbsVelocity != null)
             {
                 victimPawn.AbsVelocity.X = vel.X;
                 victimPawn.AbsVelocity.Y = vel.Y;
                 victimPawn.AbsVelocity.Z = vel.Z;
             }
-            
-            // 2. Queue the standard Teleport to shove players who survive the damage
             victimPawn.Teleport(null, null, vel);
-            
+
+            // 2. Push the ragdoll if the player dies
+            // The engine uses DamageForce to apply physics impulses to the ragdoll upon death.
+            // Physics impulses require a much larger scale than velocity (usually ~100x).
+            if (info.DamageForce != null)
+            {
+                info.DamageForce.X = vel.X * 100.0f;
+                info.DamageForce.Y = vel.Y * 100.0f;
+                info.DamageForce.Z = vel.Z * 100.0f;
+            }
+
             return HookResult.Continue;
         }
 
