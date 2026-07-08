@@ -38,6 +38,9 @@ namespace ZeusOnlyMode
         [JsonPropertyName("CookedChickenModel")]
         public string CookedChickenModel { get; set; } = "models/chicken/chicken_roasted.vmdl";
 
+        [JsonPropertyName("CookedChickenParticle")]
+        public string CookedChickenParticle { get; set; } = "particles/chicken/chicken_roasted_steam.vpcf";
+
         // Used to refund players when a blocked purchase slips through
         // (e.g. via the buy menu UI). Values verified against current CS2.
         [JsonPropertyName("WeaponPrices")]
@@ -200,6 +203,8 @@ namespace ZeusOnlyMode
             {
                 if (!string.IsNullOrEmpty(Config.CookedChickenModel))
                     manifest.AddResource(Config.CookedChickenModel);
+                if (!string.IsNullOrEmpty(Config.CookedChickenParticle))
+                    manifest.AddResource(Config.CookedChickenParticle);
             });
 
             RegisterEventHandler<EventGameEnd>(OnMapEnd);
@@ -482,7 +487,7 @@ namespace ZeusOnlyMode
                 // Compare against the chicken's body center, not its feet
                 var center = new Vector(chicken.AbsOrigin.X, chicken.AbsOrigin.Y, chicken.AbsOrigin.Z + 18.0f);
 
-                if (DistancePointToSegment(center, start, end) <= 48.0f)
+                if (DistancePointToSegment(center, start, end) <= 20.0f)
                     CookChicken(chicken);
             }
         }
@@ -507,7 +512,9 @@ namespace ZeusOnlyMode
         {
             // Copy everything we need BEFORE removing the chicken
             var origin = chicken.AbsOrigin!;
-            var pos = new Vector(origin.X, origin.Y, origin.Z + 2.0f);
+            // A few ticks lower on Z — the roast model's origin sits higher
+            // than the live chicken's, so without this it floats.
+            var pos = new Vector(origin.X, origin.Y, origin.Z - 6.0f);
             float yaw = (float)rng.Next(0, 360);
             string liveModel = chicken.CBodyComponent?.SceneNode?.GetSkeletonInstance().ModelState.ModelName ?? string.Empty;
 
@@ -537,14 +544,38 @@ namespace ZeusOnlyMode
                 return;
             }
 
-            // Upright this time — the roast sits on the ground like the real one
+            // Upright — the roast sits on the ground like the real one
             roast.Teleport(pos, new QAngle(0.0f, yaw, 0.0f), new Vector());
+
+            SpawnSteam(new Vector(origin.X, origin.Y, origin.Z + 4.0f));
 
             var roastRef = roast;
             AddTimer(60.0f, () =>
             {
                 if (roastRef.IsValid)
                     roastRef.Remove();
+            });
+        }
+
+        // Rising steam over a fresh roast
+        private void SpawnSteam(Vector pos)
+        {
+            if (string.IsNullOrEmpty(Config.CookedChickenParticle))
+                return;
+
+            var particle = Utilities.CreateEntityByName<CParticleSystem>("info_particle_system");
+            if (particle == null) return;
+
+            particle.EffectName = Config.CookedChickenParticle;
+            particle.StartActive = true;
+            particle.Teleport(pos, new QAngle(), new Vector());
+            particle.DispatchSpawn();
+
+            var particleRef = particle;
+            AddTimer(60.0f, () =>
+            {
+                if (particleRef.IsValid)
+                    particleRef.Remove();
             });
         }
 
@@ -697,7 +728,24 @@ namespace ZeusOnlyMode
             float force = Config.SuperZeusKnockbackForce;
             var vel = new Vector(dx / horiz * force, dy / horiz * force, force * 0.35f);
 
-            victimPawn.Teleport(null, null, vel);
+            if (victimPawn.LifeState == (byte)LifeState_t.LIFE_ALIVE)
+            {
+                // Survived the shot — shove the living player directly.
+                victimPawn.Teleport(null, null, vel);
+            }
+            else
+            {
+                // The zeus almost always kills outright, which instantly turns
+                // the pawn into a ragdoll — teleporting the dead pawn does
+                // nothing (that was the "only affects guns" bug). Push the
+                // ragdoll on the next frame, once the game has created it.
+                Server.NextFrame(() =>
+                {
+                    var ragdoll = victimPawn.Ragdoll.Value;
+                    if (ragdoll != null && ragdoll.IsValid)
+                        ragdoll.Teleport(null, null, vel);
+                });
+            }
 
             return HookResult.Continue;
         }
@@ -751,19 +799,72 @@ namespace ZeusOnlyMode
                 eye.Y + unit.Y * 16.0f + right.Y * 5.0f,
                 eye.Z + unit.Z * 16.0f - 3.0f);
 
-            // Three thin bolts that share the barrel and the impact point but
-            // jitter independently in between — an electric arc bundle
+            // Build 3 bolts of 3 segments each. Instead of spawning-and-
+            // discarding, we keep the beam entities alive and re-jitter their
+            // interior points every animation frame — the arc visibly crawls
+            // and flickers along its length like a real lightning strike.
+            var amps = new float[] { 6.0f, 10.0f, 14.0f };
+            var bolts = new List<CBeam[]>(3);
+
             for (int bolt = 0; bolt < 3; bolt++)
             {
-                float amp = 6.0f + bolt * 4.0f;
+                var segs = new CBeam[3];
+                bool ok = true;
+                for (int s = 0; s < 3; s++)
+                {
+                    var beam = CreateBeam();
+                    if (beam == null) { ok = false; break; }
+                    segs[s] = beam;
+                }
 
-                var mid1 = JitterPoint(Lerp(barrel, end, 0.33f), right, amp);
-                var mid2 = JitterPoint(Lerp(barrel, end, 0.66f), right, amp);
+                if (!ok)
+                {
+                    foreach (var sg in segs)
+                        if (sg != null && sg.IsValid) sg.Remove();
+                    continue;
+                }
 
-                SpawnBeamSegment(barrel, mid1);
-                SpawnBeamSegment(mid1, mid2);
-                SpawnBeamSegment(mid2, end);
+                bolts.Add(segs);
             }
+
+            if (bolts.Count == 0) return;
+
+            // Recompute every segment with fresh jitter
+            void Reposition()
+            {
+                for (int b = 0; b < bolts.Count; b++)
+                {
+                    float amp = amps[b];
+                    var mid1 = JitterPoint(Lerp(barrel, end, 0.33f), right, amp);
+                    var mid2 = JitterPoint(Lerp(barrel, end, 0.66f), right, amp);
+
+                    SetBeam(bolts[b][0], barrel, mid1);
+                    SetBeam(bolts[b][1], mid1, mid2);
+                    SetBeam(bolts[b][2], mid2, end);
+                }
+            }
+
+            // First frame immediately, then animate for ~0.4s (10 frames @ 40ms)
+            Reposition();
+
+            int frames = 0;
+            const int maxFrames = 10;
+            CounterStrikeSharp.API.Modules.Timers.Timer? anim = null;
+            anim = AddTimer(0.04f, () =>
+            {
+                frames++;
+
+                if (frames >= maxFrames)
+                {
+                    anim?.Kill();
+                    foreach (var segs in bolts)
+                        foreach (var beam in segs)
+                            if (beam.IsValid) beam.Remove();
+                    return;
+                }
+
+                Reposition();
+            }, TimerFlags.REPEAT);
         }
 
         private static Vector Lerp(Vector a, Vector b, float t)
@@ -781,26 +882,29 @@ namespace ZeusOnlyMode
                 basePoint.Z + u);
         }
 
-        private void SpawnBeamSegment(Vector start, Vector end)
+        // Create a beam entity, styled, spawned, but left in place for the
+        // animation loop to position each frame.
+        private CBeam? CreateBeam()
         {
             var beam = Utilities.CreateEntityByName<CBeam>("beam");
-            if (beam == null) return;
+            if (beam == null) return null;
 
             beam.Render = Color.FromArgb(255, 170, 215, 255); // electric blue-white
-            beam.Width = 0.5f;
+            beam.Width = 0.25f;
+            beam.DispatchSpawn();
+            return beam;
+        }
+
+        // Move an existing beam's endpoints and network the change.
+        private static void SetBeam(CBeam beam, Vector start, Vector end)
+        {
+            if (!beam.IsValid) return;
 
             beam.Teleport(start, new QAngle(), new Vector());
             beam.EndPos.X = end.X;
             beam.EndPos.Y = end.Y;
             beam.EndPos.Z = end.Z;
-
-            beam.DispatchSpawn();
-
-            AddTimer(0.15f, () =>
-            {
-                if (beam.IsValid)
-                    beam.Remove();
-            });
+            Utilities.SetStateChanged(beam, "CBeam", "m_vecEndPos");
         }
 
         private static Vector AngleToForward(QAngle angles)
