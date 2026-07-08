@@ -569,7 +569,7 @@ namespace ZeusOnlyMode
             if (string.IsNullOrEmpty(Config.CookedChickenParticle))
                 return;
 
-            var particle = Utilities.CreateEntityByName<CParticleSystem>("info_particle_system");
+            var particle = Utilities.CreateEntityByName<CInfoParticleSystem>("info_particle_system");
             if (particle == null) return;
 
             particle.EffectName = Config.CookedChickenParticle;
@@ -747,10 +747,18 @@ namespace ZeusOnlyMode
 
             float force = Config.SuperZeusKnockbackForce;
             var vel = new Vector(dx / horiz * force, dy / horiz * force, force * 0.35f);
-
-            // Set the pawn's velocity now, before death resolves.
+            
+            // 1. Explicitly set AbsVelocity so the ragdoll snapshot catches it immediately upon death
+            if (victimPawn.AbsVelocity != null)
+            {
+                victimPawn.AbsVelocity.X = vel.X;
+                victimPawn.AbsVelocity.Y = vel.Y;
+                victimPawn.AbsVelocity.Z = vel.Z;
+            }
+            
+            // 2. Queue the standard Teleport to shove players who survive the damage
             victimPawn.Teleport(null, null, vel);
-
+            
             return HookResult.Continue;
         }
 
