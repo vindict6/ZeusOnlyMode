@@ -736,14 +736,33 @@ namespace ZeusOnlyMode
             else
             {
                 // The zeus almost always kills outright, which instantly turns
-                // the pawn into a ragdoll — teleporting the dead pawn does
-                // nothing (that was the "only affects guns" bug). Push the
-                // ragdoll on the next frame, once the game has created it.
+                // the pawn into a cs_ragdoll — teleporting the dead pawn does
+                // nothing (that was the "only affects guns" bug). The ragdoll
+                // isn't exposed as a pawn property in this API version, so we
+                // find it by designer name, matching the one that spawned at
+                // the victim's death position, and shove that.
+                float px = victimPawn.AbsOrigin.X;
+                float py = victimPawn.AbsOrigin.Y;
+                float pz = victimPawn.AbsOrigin.Z;
+
                 Server.NextFrame(() =>
                 {
-                    var ragdoll = victimPawn.Ragdoll.Value;
-                    if (ragdoll != null && ragdoll.IsValid)
-                        ragdoll.Teleport(null, null, vel);
+                    CBaseEntity? nearest = null;
+                    float best = 96.0f * 96.0f; // must be within ~96 units of death spot
+
+                    foreach (var rag in Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("cs_ragdoll"))
+                    {
+                        if (rag == null || !rag.IsValid || rag.AbsOrigin == null) continue;
+
+                        float rdx = rag.AbsOrigin.X - px;
+                        float rdy = rag.AbsOrigin.Y - py;
+                        float rdz = rag.AbsOrigin.Z - pz;
+                        float d2 = rdx * rdx + rdy * rdy + rdz * rdz;
+
+                        if (d2 < best) { best = d2; nearest = rag; }
+                    }
+
+                    nearest?.Teleport(null, null, vel);
                 });
             }
 
