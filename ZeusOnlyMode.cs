@@ -566,26 +566,29 @@ namespace ZeusOnlyMode
         // Rising steam over a fresh roast
         private void SpawnSteam(Vector pos)
         {
-            if (string.IsNullOrEmpty(Config.CookedChickenParticle))
-                return;
-
-            var particle = Utilities.CreateEntityByName<CInfoParticleSystem>("info_particle_system");
-            if (particle == null) return;
-
-            particle.EffectName = Config.CookedChickenParticle;
-            particle.StartActive = true;
-            particle.Teleport(pos, new QAngle(), new Vector());
-            particle.DispatchSpawn();
-
-            // StartActive alone often doesn't kick the system; the explicit
-            // Start input is what reliably makes it emit.
-            particle.AcceptInput("Start");
-
-            var particleRef = particle;
-            AddTimer(60.0f, () =>
-            {
-                if (particleRef.IsValid)
-                    particleRef.Remove();
+            // 1. Create the entity using the correct CParticleSystem wrapper
+                var particle = Utilities.CreateEntityByName<CParticleSystem>("info_particle_system");
+                if (particle == null || !particle.IsValid) return;
+                
+                // 2. Set the effect name (replace with your specific zeus/steam particle path)
+                // Example: "particles/weapons/taser/taser_hit.vpcf"
+                particle.EffectName = "particles/weapons/taser/taser_hit.vpcf"; 
+                
+                // 3. Dispatch spawn BEFORE teleporting or sending inputs
+                particle.DispatchSpawn();
+                
+                // 4. Teleport to the victim's location
+                particle.Teleport(victimPawn.AbsOrigin, null, null);
+                
+                // 5. Fire the Start input to play the particle
+                particle.AcceptInput("Start");
+                
+                // 6. (Optional but recommended) Kill the particle entity after a few seconds to prevent memory leaks
+                AddTimer(3.0f, () => {
+                    if (particle != null && particle.IsValid)
+                    {
+                        particle.AcceptInput("Kill");
+                    }
             });
         }
 
