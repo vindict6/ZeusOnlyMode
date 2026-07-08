@@ -564,31 +564,36 @@ namespace ZeusOnlyMode
         }
 
         // Rising steam over a fresh roast
+        // Rising steam over a fresh roast
         private void SpawnSteam(Vector pos)
         {
-            // 1. Create the entity using the correct CParticleSystem wrapper
-                var particle = Utilities.CreateEntityByName<CParticleSystem>("info_particle_system");
-                if (particle == null || !particle.IsValid) return;
-                
-                // 2. Set the effect name (replace with your specific zeus/steam particle path)
-                // Example: "particles/weapons/taser/taser_hit.vpcf"
-                particle.EffectName = "particles/weapons/taser/taser_hit.vpcf"; 
-                
-                // 3. Dispatch spawn BEFORE teleporting or sending inputs
-                particle.DispatchSpawn();
-                
-                // 4. Teleport to the victim's location
-                particle.Teleport(victimPawn.AbsOrigin, null, null);
-                
-                // 5. Fire the Start input to play the particle
-                particle.AcceptInput("Start");
-                
-                // 6. (Optional but recommended) Kill the particle entity after a few seconds to prevent memory leaks
-                AddTimer(3.0f, () => {
-                    if (particle != null && particle.IsValid)
-                    {
-                        particle.AcceptInput("Kill");
-                    }
+            if (string.IsNullOrEmpty(Config.CookedChickenParticle))
+                return;
+
+            // 1. Create the entity
+            var particle = Utilities.CreateEntityByName<CParticleSystem>("info_particle_system");
+            if (particle == null || !particle.IsValid) return;
+
+            // 2. Set the effect name
+            particle.EffectName = Config.CookedChickenParticle;
+
+            // 3. Dispatch spawn BEFORE teleporting or sending inputs
+            particle.DispatchSpawn();
+
+            // 4. Teleport to the 'pos' vector passed into the method (NOT victimPawn)
+            particle.Teleport(pos, null, null);
+
+            // 5. Fire the Start input to play the particle
+            particle.AcceptInput("Start");
+
+            // 6. Clean up the particle entity after 60 seconds (matching the roast timer)
+            var particleRef = particle;
+            AddTimer(60.0f, () =>
+            {
+                if (particleRef != null && particleRef.IsValid)
+                {
+                    particleRef.AcceptInput("Kill");
+                }
             });
         }
 
