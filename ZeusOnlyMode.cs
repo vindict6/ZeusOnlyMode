@@ -178,10 +178,9 @@ namespace ZeusOnlyMode
             RegisterListener<Listeners.OnMapEnd>(OnMapEndCleanup);
             RegisterListener<Listeners.OnMapStart>(OnMapStartCleanup);
 
-            // Intercept damage before it's applied: this is how we turn the
-            // zeus's shock damage into burn damage on chickens, which makes
-            // the game roast them exactly like a molotov/incendiary kill.
-            RegisterListener<Listeners.OnEntityTakeDamagePre>(OnEntityTakeDamagePre);
+            // Follows each zeus shot to its exact trace endpoint; powers both
+            // the extended lightning visual and chicken detection.
+            RegisterEventHandler<EventBulletImpact>(OnBulletImpact);
 
             RegisterEventHandler<EventGameEnd>(OnMapEnd);
             // Hook buy command
@@ -234,6 +233,7 @@ namespace ZeusOnlyMode
 
             zeusOnlyEnabled = false;
             savedWeapons.Clear();
+            Array.Clear(pendingZap, 0, pendingZap.Length);
 
             zeusReminderTimer?.Kill();
             zeusReminderTimer = null;
@@ -444,33 +444,73 @@ namespace ZeusOnlyMode
         }
 
         // ------------------------------------------------------------------
-        // Chicken cooking: zeus a chicken -> roast chicken.
+        // Chicken cooking.
         //
-        // The game decides "roasted" by the damage type that killed the
-        // chicken (DMG_BURN, i.e. molotov/incendiary). The zeus deals
-        // DMG_SHOCK, so we intercept the damage right before it's applied
-        // and swap shock for burn — the game then handles the cooked model
-        // and sizzle itself, identical to a fire kill.
+        // The zeus's trace ignores chickens entirely in CS2 — they never take
+        // damage from it, so there is no damage event to piggyback on. We
+        // detect chickens near the zap line ourselves and serve them
+        // well-done: the live chicken is removed and replaced with a charred,
+        // knocked-over copy of its own model.
         // ------------------------------------------------------------------
-        private HookResult OnEntityTakeDamagePre(CBaseEntity entity, CTakeDamageInfo info)
+        private void CookChickensAlongLine(Vector start, Vector end)
         {
-            if (entity == null || !entity.IsValid)
-                return HookResult.Continue;
+            foreach (var chicken in Utilities.FindAllEntitiesByDesignerName<CChicken>("chicken"))
+            {
+                if (chicken == null || !chicken.IsValid || chicken.AbsOrigin == null)
+                    continue;
 
-            if (entity.DesignerName != "chicken")
-                return HookResult.Continue;
+                // Compare against the chicken's body center, not its feet
+                var center = new Vector(chicken.AbsOrigin.X, chicken.AbsOrigin.Y, chicken.AbsOrigin.Z + 18.0f);
 
-            bool fromZeus =
-                info.Ability.Value?.DesignerName == "weapon_taser" ||
-                ((int)info.BitsDamageType & (int)DamageTypes_t.DMG_SHOCK) != 0;
+                if (DistancePointToSegment(center, start, end) <= 48.0f)
+                    CookChicken(chicken);
+            }
+        }
 
-            if (!fromZeus)
-                return HookResult.Continue;
+        private static float DistancePointToSegment(Vector p, Vector a, Vector b)
+        {
+            float abX = b.X - a.X, abY = b.Y - a.Y, abZ = b.Z - a.Z;
+            float apX = p.X - a.X, apY = p.Y - a.Y, apZ = p.Z - a.Z;
 
-            info.BitsDamageType = DamageTypes_t.DMG_BURN;
-            info.Damage = Math.Max(info.Damage, 100.0f); // make sure it cooks through
+            float abLenSq = abX * abX + abY * abY + abZ * abZ;
+            float t = abLenSq < 0.0001f ? 0.0f
+                : Math.Clamp((apX * abX + apY * abY + apZ * abZ) / abLenSq, 0.0f, 1.0f);
 
-            return HookResult.Continue;
+            float cX = a.X + abX * t - p.X;
+            float cY = a.Y + abY * t - p.Y;
+            float cZ = a.Z + abZ * t - p.Z;
+
+            return (float)Math.Sqrt(cX * cX + cY * cY + cZ * cZ);
+        }
+
+        private void CookChicken(CChicken chicken)
+        {
+            // Copy everything we need BEFORE removing the chicken
+            var origin = chicken.AbsOrigin!;
+            var pos = new Vector(origin.X, origin.Y, origin.Z + 4.0f);
+            string model = chicken.CBodyComponent?.SceneNode?.GetSkeletonInstance().ModelState.ModelName ?? string.Empty;
+
+            chicken.AcceptInput("Kill");
+
+            if (string.IsNullOrEmpty(model))
+                return;
+
+            // The roast: same model, charred color, flopped on its side
+            var roast = Utilities.CreateEntityByName<CDynamicProp>("prop_dynamic_override");
+            if (roast == null) return;
+
+            roast.DispatchSpawn();
+            roast.SetModel(model);
+            roast.Render = Color.FromArgb(255, 45, 28, 18);
+            Utilities.SetStateChanged(roast, "CBaseModelEntity", "m_clrRender");
+            roast.Teleport(pos, new QAngle(0.0f, (float)rng.Next(0, 360), 90.0f), new Vector());
+
+            var roastRef = roast;
+            AddTimer(60.0f, () =>
+            {
+                if (roastRef.IsValid)
+                    roastRef.Remove();
+            });
         }
 
         // ------------------------------------------------------------------
@@ -520,10 +560,14 @@ namespace ZeusOnlyMode
             return HookResult.Continue;
         }
 
-        // Draw the extended electrical arc when a super-zeus is fired.
-        // The stock zap particle is client-side and stays short, so we draw
-        // a jagged server-side lightning beam out to the real (3x) range
-        // that everyone can see.
+        // Zap tracking. weapon_fire tells us a zeus was fired; the game's own
+        // bullet_impact event for that same shot tells us EXACTLY where the
+        // trace ended in world space. Anchoring on the impact point fixes the
+        // bolt's direction (no eye-angle math), makes it reach precisely as
+        // far as the shot did, stops it at walls, and gives us the true line
+        // for chicken detection.
+        private readonly bool[] pendingZap = new bool[65];
+
         private HookResult OnWeaponFire(EventWeaponFire ev, GameEventInfo info)
         {
             string weaponName = ev.Weapon.Replace("weapon_", "").ToLowerInvariant();
@@ -533,36 +577,90 @@ namespace ZeusOnlyMode
             // Belt-and-suspenders: make sure the range matches the toggle
             ApplyTaserRangeToAll();
 
-            if (!superZeusEnabled)
-                return HookResult.Continue;
-
             var player = ev.Userid;
             if (player == null || !player.IsValid)
                 return HookResult.Continue;
 
-            DrawZeusLightning(player);
+            int slot = player.Slot;
+            pendingZap[slot] = true;
+
+            // Fallback: if no impact event arrives for this shot, project
+            // along the shooter's view for the full zeus range next frame.
+            Server.NextFrame(() =>
+            {
+                if (!pendingZap[slot]) return;
+                pendingZap[slot] = false;
+
+                if (player == null || !player.IsValid) return;
+
+                var pawn = player.PlayerPawn.Value;
+                if (pawn == null || pawn.AbsOrigin == null) return;
+
+                var eye = GetEyePosition(pawn);
+                var fwd = AngleToForward(pawn.EyeAngles);
+                float range = (originalTaserRange ?? DefaultTaserRange)
+                              * (superZeusEnabled ? SuperZeusRangeMultiplier : 1.0f);
+                var end = new Vector(eye.X + fwd.X * range, eye.Y + fwd.Y * range, eye.Z + fwd.Z * range);
+
+                HandleZap(eye, end);
+            });
 
             return HookResult.Continue;
         }
 
-        private void DrawZeusLightning(CCSPlayerController player)
+        private HookResult OnBulletImpact(EventBulletImpact ev, GameEventInfo info)
         {
+            var player = ev.Userid;
+            if (player == null || !player.IsValid)
+                return HookResult.Continue;
+
+            int slot = player.Slot;
+            if (!pendingZap[slot])
+                return HookResult.Continue; // some other weapon's bullet
+
+            pendingZap[slot] = false;
+
             var pawn = player.PlayerPawn.Value;
             if (pawn == null || pawn.AbsOrigin == null)
-                return;
+                return HookResult.Continue;
 
+            var eye = GetEyePosition(pawn);
+            var end = new Vector(ev.X, ev.Y, ev.Z);
+
+            HandleZap(eye, end);
+
+            return HookResult.Continue;
+        }
+
+        private void HandleZap(Vector eye, Vector end)
+        {
+            if (superZeusEnabled)
+            {
+                // Start slightly below the eye so the arc reads as from the gun
+                var start = new Vector(eye.X, eye.Y, eye.Z - 6.0f);
+                DrawZeusLightning(start, end);
+            }
+
+            // Chickens cook at any zeus range, super or not
+            CookChickensAlongLine(eye, end);
+        }
+
+        private static Vector GetEyePosition(CCSPlayerPawn pawn)
+        {
             float viewOffsetZ = pawn.CameraServices?.OldPlayerViewOffsetZ ?? 64.0f;
-            var eye = new Vector(pawn.AbsOrigin.X, pawn.AbsOrigin.Y, pawn.AbsOrigin.Z + viewOffsetZ);
-            var fwd = AngleToForward(pawn.EyeAngles);
+            return new Vector(pawn.AbsOrigin!.X, pawn.AbsOrigin.Y, pawn.AbsOrigin.Z + viewOffsetZ);
+        }
 
-            float range = (originalTaserRange ?? DefaultTaserRange) * SuperZeusRangeMultiplier;
+        private void DrawZeusLightning(Vector start, Vector end)
+        {
+            var dir = new Vector(end.X - start.X, end.Y - start.Y, end.Z - start.Z);
+            float len = (float)Math.Sqrt(dir.X * dir.X + dir.Y * dir.Y + dir.Z * dir.Z);
+            if (len < 1.0f) return;
 
-            // Start slightly below the eye so the arc reads as coming from the weapon
-            var start = new Vector(eye.X, eye.Y, eye.Z - 6.0f);
-            var end = new Vector(eye.X + fwd.X * range, eye.Y + fwd.Y * range, eye.Z + fwd.Z * range);
+            // Horizontal perpendicular, used to jitter the midpoints sideways
+            var right = new Vector(dir.Y / len, -dir.X / len, 0.0f);
 
             // Two jittered midpoints give it a jagged, electric look
-            var right = new Vector(fwd.Y, -fwd.X, 0.0f);
             var mid1 = JitterPoint(Lerp(start, end, 0.33f), right, 10.0f);
             var mid2 = JitterPoint(Lerp(start, end, 0.66f), right, 10.0f);
 
