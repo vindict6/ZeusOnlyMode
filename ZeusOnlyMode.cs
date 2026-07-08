@@ -496,7 +496,9 @@ namespace ZeusOnlyMode
 
         private void ApplyTaserRange(CBasePlayerWeapon taser)
         {
-            var vdata = taser.VData;
+            // VData is typed as the base CBasePlayerWeaponVData; Range
+            // (m_flRange) lives on the derived CCSWeaponBaseVData, so re-wrap.
+            var vdata = taser.VData?.As<CCSWeaponBaseVData>();
             if (vdata == null) return;
 
             originalTaserRange ??= vdata.Range;
@@ -589,7 +591,6 @@ namespace ZeusOnlyMode
             var beam = Utilities.CreateEntityByName<CBeam>("beam");
             if (beam == null) return;
 
-            beam.RenderMode = RenderMode_t.kRenderTransColor;
             beam.Render = Color.FromArgb(255, 170, 215, 255); // electric blue-white
             beam.Width = 1.2f;
 
