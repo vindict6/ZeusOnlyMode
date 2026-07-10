@@ -10,10 +10,10 @@ using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Linq;
 using System.Text.Json.Serialization;
-using System.Threading.Channels;
 using static CounterStrikeSharp.API.Core.Listeners;
 
 namespace ZeusOnlyMode
@@ -92,7 +92,7 @@ namespace ZeusOnlyMode
     public class ZeusOnlyPlugin : BasePlugin, IPluginConfig<ZeusOnlyConfig>
     {
         public override string ModuleName => "Zeus Only Mode";
-        public override string ModuleVersion => "3.2";
+        public override string ModuleVersion => "3.3";
 
         public ZeusOnlyConfig Config { get; set; } = new();
 
@@ -163,12 +163,12 @@ namespace ZeusOnlyMode
 
         // Dictionary to hold saved weapons per player
         private readonly Dictionary<ulong, List<SavedWeapon>> savedWeapons = new();
+
         public override void Load(bool hotReload)
         {
             // Console / RCON entry points (css_zeusmode, css_zeus_mode,
             // css_superzeus) are auto-registered from the [ConsoleCommand]
-            // attributes on their handler methods and are admin-gated by the
-            // [RequiresPermissions] attribute.
+            // attributes on their handler methods.
             //
             // Chat is handled separately in OnSay so we can (a) accept the
             // commands with OR without a !// prefix and (b) swallow the
@@ -182,7 +182,12 @@ namespace ZeusOnlyMode
             RegisterEventHandler<EventItemEquip>(OnItemEquip);
             RegisterEventHandler<EventWeaponFire>(OnWeaponFire);
 
-            RegisterListener<Listeners.OnClientPutInServer>(OnPlayerJoin);
+            // FIX (crash on join / warmup): the old OnClientPutInServer
+            // listener ran before the player had a pawn or a team, so
+            // GiveNamedItem there could throw. player_spawn fires every time
+            // a pawn actually exists — including warmup respawns — which is
+            // exactly when we want to snapshot/strip/give the taser.
+            RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn);
 
             // EventGameEnd does NOT fire on mp_changelevel / RTV map switches,
             // which left the mode stuck on across maps. These listeners fire
@@ -214,6 +219,7 @@ namespace ZeusOnlyMode
             // Hook buy command
             AddCommandListener("buy", OnBuyCommand);
         }
+
         // Natural game end (scoreboard) — entities are still alive here, so we
         // can be polite: restore loadouts and announce before resetting.
         private HookResult OnMapEnd(EventGameEnd ev, GameEventInfo info)
@@ -263,6 +269,11 @@ namespace ZeusOnlyMode
             savedWeapons.Clear();
             Array.Clear(pendingZap, 0, pendingZap.Length);
 
+            // FIX (dead commands after map change): reset the debounce
+            // timestamps too, so a stale value can never lock the toggles out.
+            lastZeusToggle = double.NegativeInfinity;
+            lastSuperToggle = double.NegativeInfinity;
+
             zeusReminderTimer?.Kill();
             zeusReminderTimer = null;
         }
@@ -284,9 +295,19 @@ namespace ZeusOnlyMode
         // A single chat line can reach the toggle twice (once via OnSay, once
         // via the built-in !// -> css_ dispatch). This debounce guarantees one
         // physical command = one toggle no matter what.
-        private float lastZeusToggle = -1.0f;
-        private float lastSuperToggle = -1.0f;
-        private const float ToggleDebounce = 0.25f;
+        //
+        // FIX (dead commands after map change): the debounce previously used
+        // Server.CurrentTime, which RESETS TO ~0 ON EVERY MAP CHANGE. If the
+        // last toggle happened at, say, 500s into the old map, then on the new
+        // map "CurrentTime - lastToggle" was hugely negative, the debounce
+        // check passed as "too soon", and EVERY toggle was silently swallowed
+        // until server time crawled past the stale value — the plugin looked
+        // completely dead. We now use a monotonic wall clock that never resets.
+        private static double MonotonicNow => Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
+
+        private double lastZeusToggle = double.NegativeInfinity;
+        private double lastSuperToggle = double.NegativeInfinity;
+        private const double ToggleDebounce = 0.25;
 
         // --- Console / RCON commands (attribute-registered, admin only) ----
 
@@ -365,8 +386,8 @@ namespace ZeusOnlyMode
 
         private void DoZeusToggle(CCSPlayerController? caller, bool? explicitState)
         {
-            if (Server.CurrentTime - lastZeusToggle < ToggleDebounce) return;
-            lastZeusToggle = Server.CurrentTime;
+            if (MonotonicNow - lastZeusToggle < ToggleDebounce) return;
+            lastZeusToggle = MonotonicNow;
 
             bool newState = explicitState ?? !zeusOnlyEnabled;
 
@@ -381,8 +402,8 @@ namespace ZeusOnlyMode
 
         private void DoSuperToggle(CCSPlayerController? caller, bool? explicitState)
         {
-            if (Server.CurrentTime - lastSuperToggle < ToggleDebounce) return;
-            lastSuperToggle = Server.CurrentTime;
+            if (MonotonicNow - lastSuperToggle < ToggleDebounce) return;
+            lastSuperToggle = MonotonicNow;
 
             bool newState = explicitState ?? !superZeusEnabled;
 
@@ -427,7 +448,7 @@ namespace ZeusOnlyMode
         {
             zeusOnlyEnabled = newState;
 
-            if (zeusOnlyEnabled) // after you set zeusOnlyEnabled = newState and it's true
+            if (zeusOnlyEnabled)
             {
                 Server.PrintToChatAll("Zeus Mode Enabled — Loadouts Have Been Snapshot.");
 
@@ -439,13 +460,11 @@ namespace ZeusOnlyMode
                     // safe to manipulate loadout
                     SavePlayerLoadout(p);
                     StripIllegalWeapons(p);
-
-                    // ensure Zeus
-                    p.GiveNamedItem("weapon_taser");
-                    p.ExecuteClientCommand("slot11");
+                    EnsureTaser(p);
                 }
 
-                // Start reminder timer
+                // Start reminder timer (kill any leftover first, just in case)
+                zeusReminderTimer?.Kill();
                 zeusReminderTimer = AddTimer(5.0f, () =>
                 {
                     if (zeusOnlyEnabled)
@@ -564,29 +583,20 @@ namespace ZeusOnlyMode
         }
 
         // Rising steam over a fresh roast
-        // Rising steam over a fresh roast
         private void SpawnSteam(Vector pos)
         {
             if (string.IsNullOrEmpty(Config.CookedChickenParticle))
                 return;
 
-            // 1. Create the entity
             var particle = Utilities.CreateEntityByName<CParticleSystem>("info_particle_system");
             if (particle == null || !particle.IsValid) return;
 
-            // 2. Set the effect name
             particle.EffectName = Config.CookedChickenParticle;
 
-            // 3. Dispatch spawn BEFORE teleporting or sending inputs
             particle.DispatchSpawn();
-
-            // 4. Teleport to the 'pos' vector passed into the method (NOT victimPawn)
             particle.Teleport(pos, null, null);
-
-            // 5. Fire the Start input to play the particle
             particle.AcceptInput("Start");
 
-            // 6. Clean up the particle entity after 60 seconds (matching the roast timer)
             var particleRef = particle;
             AddTimer(60.0f, () =>
             {
@@ -999,15 +1009,23 @@ namespace ZeusOnlyMode
             if (!savedWeapons.TryGetValue(steamId, out var weapons))
                 return;
 
-            // Remove everything the player currently has
-            foreach (var handle in player.PlayerPawn.Value?.WeaponServices?.MyWeapons
-                     ?? Enumerable.Empty<CHandle<CBasePlayerWeapon>>())
+            var pawn = player.PlayerPawn.Value;
+            var weaponServices = pawn?.WeaponServices;
+
+            // Remove everything the player currently has — SAFELY. The old
+            // code blind-killed every weapon (including the one in the
+            // player's hands) while iterating the live list; see
+            // RemoveWeaponFromPlayer for why that crashes.
+            if (pawn != null && weaponServices != null)
             {
-                var weapon = handle.Value;
-                if (weapon != null && weapon.IsValid)
-                {
-                    weapon.AcceptInput("Kill");
-                }
+                var current = weaponServices.MyWeapons
+                    .Select(h => h.Value)
+                    .Where(w => w != null && w.IsValid)
+                    .Cast<CBasePlayerWeapon>()
+                    .ToList();
+
+                foreach (var weapon in current)
+                    RemoveWeaponFromPlayer(pawn, weapon);
             }
 
             // Give back saved weapons, then re-apply any plugin-set skin data
@@ -1033,11 +1051,6 @@ namespace ZeusOnlyMode
             }
         }
 
-        // (Old string-based Save/Restore helpers removed — superseded by the
-        // skin-aware SavedWeapon snapshot above.)
-
-
-
         private HookResult OnRoundStart(EventRoundStart ev, GameEventInfo info)
         {
             // Clear all loadouts when a new round starts
@@ -1049,47 +1062,143 @@ namespace ZeusOnlyMode
             if (!zeusOnlyEnabled)
                 return HookResult.Continue;
 
-            foreach (var player in Utilities.GetPlayers())
+            // Defer one frame so round-start weapon distribution has actually
+            // finished before we snapshot and strip.
+            Server.NextFrame(() =>
             {
-                if (player == null || !player.IsValid || player.TeamNum < 2) continue;
+                if (!zeusOnlyEnabled) return;
 
-                // Save fresh round loadout before stripping
-                SavePlayerLoadout(player);
-
-                StripIllegalWeapons(player);
-
-                // Ensure Zeus is in slot
-                bool hasTaser = player.PlayerPawn.Value?.WeaponServices?.MyWeapons
-                    .Any(w => w.Value != null
-                           && w.Value.IsValid
-                           && w.Value.DesignerName.Equals("weapon_taser", StringComparison.OrdinalIgnoreCase))
-                    ?? false;
-
-                if (!hasTaser)
+                foreach (var player in Utilities.GetPlayers())
                 {
-                    player.GiveNamedItem("weapon_taser");
+                    if (player == null || !player.IsValid || player.TeamNum < 2 || !player.PawnIsAlive)
+                        continue;
+
+                    // Save fresh round loadout before stripping
+                    SavePlayerLoadout(player);
+                    StripIllegalWeapons(player);
+                    EnsureTaser(player);
                 }
-                player.ExecuteClientCommand("slot11");
-            }
+            });
 
             return HookResult.Continue;
+        }
+
+        // Player got a pawn (initial spawn, round spawn, WARMUP RESPAWN).
+        // This replaces the old OnClientPutInServer handler, which ran before
+        // the player had a pawn or team and could throw on GiveNamedItem.
+        // Handling spawn also means warmup respawn pistols are stripped here
+        // cleanly, instead of relying on the pickup event (see OnItemPickup).
+        private HookResult OnPlayerSpawn(EventPlayerSpawn ev, GameEventInfo info)
+        {
+            if (!zeusOnlyEnabled)
+                return HookResult.Continue;
+
+            var player = ev.Userid;
+            if (player == null || !player.IsValid)
+                return HookResult.Continue;
+
+            // Weapons are handed out around/after the spawn event — wait a
+            // frame so the spawn loadout actually exists before we touch it.
+            Server.NextFrame(() =>
+            {
+                if (!zeusOnlyEnabled || player == null || !player.IsValid ||
+                    player.TeamNum < 2 || !player.PawnIsAlive)
+                    return;
+
+                // Don't overwrite a snapshot taken earlier this round
+                if (!savedWeapons.ContainsKey(player.SteamID))
+                    SavePlayerLoadout(player);
+
+                StripIllegalWeapons(player);
+                EnsureTaser(player);
+            });
+
+            return HookResult.Continue;
+        }
+
+        // Give a taser only if the player doesn't already have one, then
+        // switch to it.
+        private void EnsureTaser(CCSPlayerController player)
+        {
+            bool hasTaser = player.PlayerPawn.Value?.WeaponServices?.MyWeapons
+                .Any(w => w.Value != null
+                       && w.Value.IsValid
+                       && w.Value.DesignerName.Equals("weapon_taser", StringComparison.OrdinalIgnoreCase))
+                ?? false;
+
+            if (!hasTaser)
+                player.GiveNamedItem("weapon_taser");
+
+            player.ExecuteClientCommand("slot11");
+        }
+
+        // ------------------------------------------------------------------
+        // Weapon removal — the crash fix.
+        //
+        // Killing the weapon entity a player is CURRENTLY HOLDING (or killing
+        // a weapon inside its own pickup event, when it's mid-equip) leaves
+        // the pawn's active-weapon pointer dangling and hard-crashes the
+        // server. During warmup this is constant: every respawn re-issues a
+        // pistol, which is both "illegal" and instantly active. The old code
+        // did exactly that (weapEnt.Remove() / AcceptInput("Kill") straight
+        // off the live MyWeapons list) — a few removals of holstered guns
+        // would work, then the first active one killed the server.
+        //
+        // Safe recipe: snapshot the weapon list first (it mutates as we
+        // remove), and if the weapon is the active one, DROP it via the
+        // game's own item-services function so the pawn cleanly deselects it,
+        // then kill the now-ownerless entity a frame later.
+        // ------------------------------------------------------------------
+        private static void RemoveWeaponFromPlayer(CCSPlayerPawn pawn, CBasePlayerWeapon weapon)
+        {
+            if (weapon == null || !weapon.IsValid) return;
+
+            var weaponServices = pawn.WeaponServices;
+            var itemServices = pawn.ItemServices;
+
+            bool isActive = weaponServices?.ActiveWeapon.Value?.Index == weapon.Index;
+
+            if (isActive && itemServices != null)
+            {
+                // Let the game detach it from the player's hands properly
+                new CCSPlayer_ItemServices(itemServices.Handle).DropActivePlayerWeapon(weapon);
+
+                // Delete the dropped world entity next frame, once the pawn
+                // no longer references it.
+                var weaponRef = weapon;
+                Server.NextFrame(() =>
+                {
+                    if (weaponRef.IsValid)
+                        weaponRef.AcceptInput("Kill");
+                });
+            }
+            else
+            {
+                // Holstered weapons are safe to kill directly
+                weapon.AcceptInput("Kill");
+            }
         }
 
         // Removes weapons not in whitelist
         private void StripIllegalWeapons(CCSPlayerController player)
         {
-            foreach (var weapon in player.PlayerPawn.Value?.WeaponServices?.MyWeapons ?? Enumerable.Empty<CHandle<CBasePlayerWeapon>>())
-            {
-                var weapEnt = weapon.Value;
+            var pawn = player.PlayerPawn.Value;
+            var weaponServices = pawn?.WeaponServices;
+            if (pawn == null || weaponServices == null) return;
 
-                if (weapEnt != null && weapEnt.IsValid)
-                {
-                    string className = weapEnt.DesignerName.Replace("weapon_", "").ToLowerInvariant();
-                    if (!allowedWeapons.Contains(className))
-                    {
-                        weapEnt.Remove(); // detaches from player
-                    }
-                }
+            // Snapshot first: MyWeapons shrinks while we remove entries, and
+            // mutating the networked list mid-iteration is unsafe.
+            var weapons = weaponServices.MyWeapons
+                .Select(h => h.Value)
+                .Where(w => w != null && w.IsValid)
+                .Cast<CBasePlayerWeapon>()
+                .ToList();
+
+            foreach (var weapEnt in weapons)
+            {
+                string className = weapEnt.DesignerName.Replace("weapon_", "").ToLowerInvariant();
+                if (!allowedWeapons.Contains(className))
+                    RemoveWeaponFromPlayer(pawn, weapEnt);
             }
         }
 
@@ -1156,14 +1265,22 @@ namespace ZeusOnlyMode
             // Safety net: whatever was bought must not stay equipped
             Server.NextFrame(() =>
             {
-                if (player != null && player.IsValid)
+                if (player != null && player.IsValid && player.PawnIsAlive)
                     StripIllegalWeapons(player);
             });
 
             return HookResult.Continue;
         }
 
-        // Remove illegal pickups from ground
+        // Remove illegal pickups from ground / spawn loadouts.
+        //
+        // FIX (server crash): the old handler found the weapon entity and
+        // AcceptInput("Kill")-ed it INSIDE the pickup event — the exact moment
+        // the weapon is being equipped as the active weapon. That's the crash
+        // you saw during warmup: respawn pistols fire item_pickup, a few got
+        // killed while holstered, then one was killed while active and the
+        // server went down. We now defer one frame and strip through the safe
+        // drop-then-kill path.
         private HookResult OnItemPickup(EventItemPickup ev, GameEventInfo info)
         {
             if (!zeusOnlyEnabled) return HookResult.Continue;
@@ -1174,52 +1291,22 @@ namespace ZeusOnlyMode
                 .Replace("item_", "")
                 .Trim();
 
-            if (!allowedWeapons.Contains(weaponName))
+            if (allowedWeapons.Contains(weaponName))
+                return HookResult.Continue;
+
+            var player = ev.Userid;
+            if (player == null || !player.IsValid)
+                return HookResult.Continue;
+
+            Server.NextFrame(() =>
             {
-                var player = ev.Userid;
-                if (player != null && player.IsValid)
-                {
-                    var pawn = player.PlayerPawn.Value;
-                    var weaponServices = pawn?.WeaponServices;
-
-                    // Find the illegal weapon entity just picked up
-                    foreach (var handle in weaponServices?.MyWeapons ?? Enumerable.Empty<CHandle<CBasePlayerWeapon>>())
-                    {
-                        var weapEnt = handle.Value;
-                        if (weapEnt != null && weapEnt.IsValid)
-                        {
-                            string className = weapEnt.DesignerName.Replace("weapon_", "").ToLowerInvariant();
-                            if (className == weaponName)
-                            {
-                                // Remove from player and kill entity so it disappears completely
-                                weapEnt.AcceptInput("Kill");
-
-                                //player.PrintToChat("[Zeus Mode] Illegal weapon removed!");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+                if (zeusOnlyEnabled && player != null && player.IsValid && player.PawnIsAlive)
+                    StripIllegalWeapons(player);
+            });
 
             return HookResult.Continue;
         }
 
-        private void OnPlayerJoin(int playerSlot)
-        {
-            var player = Utilities.GetPlayerFromSlot(playerSlot);
-            if (player == null || !player.IsValid || player.SteamID == 0) return;
-
-            if (zeusOnlyEnabled)
-            {
-                // Fresh snapshot of whatever they spawned with
-                SavePlayerLoadout(player);
-
-                StripIllegalWeapons(player);
-                player.GiveNamedItem("weapon_taser");
-                player.ExecuteClientCommand("slot11");
-            }
-        }
         public override void Unload(bool hotReload)
         {
             ResetPluginState();
